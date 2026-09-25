@@ -54,6 +54,22 @@ func (z *zeroTierFlowPath) owns(addr netip.Addr) bool {
 	return tun != nil && tunnel.ZeroTierOwnsAddress(tun, addr)
 }
 
+// zeroTierLocalServiceTarget maps a connection addressed to this node's
+// ZeroTier address to the same service on the device loopback interface. The
+// ZeroTier address exists on Firestack's userspace NIC, not on Android's
+// kernel interfaces, so dialing it with a protected OS socket would leave the
+// device and time out instead of reaching local listeners such as Termux sshd.
+func zeroTierLocalServiceTarget(target netip.AddrPort) (netip.AddrPort, bool) {
+	if !target.IsValid() {
+		return target, false
+	}
+	loopback := netip.MustParseAddr("127.0.0.1")
+	if target.Addr().Is6() {
+		loopback = netip.MustParseAddr("::1")
+	}
+	return netip.AddrPortFrom(loopback, target.Port()), true
+}
+
 func (z *zeroTierFlowPath) openPacketConn(remote netip.Addr) (net.PacketConn, bool, error) {
 	z.mu.RLock()
 	tun := z.tun
