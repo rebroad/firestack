@@ -210,6 +210,26 @@ func (h *udpHandler) proxy(gconn *netstack.GUDPConn, src, dst netip.AddrPort, dm
 // Connect connects the proxy server; thread-safe.
 func (h *udpHandler) Connect(gconn *netstack.GUDPConn, src, target netip.AddrPort, dmx netstack.DemuxerFn) (pc net.Conn, smm *FlowSummary, err error) {
 	mux := dmx != nil // also disabled for loopback mode, for now
+	if h.status.Load() == HDLEND {
+		smm = udpSummary(zeroTierFlowID(src, target), UNKNOWN_UID_STR, src.Addr(), target.Addr())
+		return nil, smm, errors.New("udp: handler ended")
+	}
+	if target.IsValid() && h.ztFlow != nil && h.ztFlow.contains(target.Addr()) && !h.ztFlow.owns(target.Addr()) {
+		smm = udpSummary(zeroTierFlowID(src, target), UNKNOWN_UID_STR, src.Addr(), target.Addr())
+		smm.PID = "ZeroTier"
+		smm.Target = target.Addr().String()
+		started := time.Now()
+		direct, _, dialErr := h.ztFlow.dial("udp", target.String())
+		if dialErr != nil || direct == nil {
+			return nil, smm, core.OneErr(dialErr, errUdpNoTarget)
+		}
+		if err = gconn.Establish(); err != nil {
+			clos(gconn, direct)
+			return nil, smm, err
+		}
+		smm.Rtt = time.Since(started).Milliseconds()
+		return direct, smm, nil
+	}
 
 	// flow is alg/nat-aware, do not change target or any addrs
 	res, undidAlg, realips, domains := h.onFlow(src, target)
@@ -362,7 +382,7 @@ func (h *udpHandler) Connect(gconn *netstack.GUDPConn, src, target netip.AddrPor
 		canportfwd = portfwd && ipn.Remote(pxid)
 
 		ztSelected := false
-		if !mux && h.ztFlow != nil && zeroTierDirectProxy(px, smm.RPID) {
+		if !mux && h.ztFlow != nil && zeroTierDirectProxy(px, smm.RPID) && !h.ztFlow.owns(selectedTarget.Addr()) {
 			pc, ztSelected, err = h.ztFlow.dial("udp", selectedTarget.String())
 		}
 		if mux { // mux is not supported by all proxies (few like Exit, Base, WG support it)

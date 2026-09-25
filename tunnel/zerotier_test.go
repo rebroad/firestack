@@ -71,6 +71,40 @@ func TestParseZeroTierRouteSyntax(t *testing.T) {
 	}
 }
 
+func TestParseZeroTierAddressesPreservesHostBits(t *testing.T) {
+	addresses, err := parsePrefixes("192.168.192.7/24, fd00::7/64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []netip.Prefix{
+		netip.MustParsePrefix("192.168.192.7/24"),
+		netip.MustParsePrefix("fd00::7/64"),
+	}
+	if len(addresses) != len(want) {
+		t.Fatalf("parsed addresses = %v; want %v", addresses, want)
+	}
+	for i := range want {
+		if addresses[i] != want[i] {
+			t.Fatalf("address %d = %v; want assigned host address %v", i, addresses[i], want[i])
+		}
+	}
+}
+
+func TestZeroTierOwnsAddressUsesAssignedHost(t *testing.T) {
+	gt := &gtunnel{ztNets: map[string]*zeroTierNetwork{
+		"network": {nicID: 2, addresses: []netip.Prefix{netip.MustParsePrefix("192.168.192.7/24")}},
+	}}
+	if !ZeroTierOwnsAddress(gt, netip.MustParseAddr("192.168.192.7")) {
+		t.Fatal("assigned ZeroTier address was not recognized")
+	}
+	if ZeroTierOwnsAddress(gt, netip.MustParseAddr("192.168.192.5")) {
+		t.Fatal("peer address was incorrectly recognized as local")
+	}
+	if nic, ok := ZeroTierNICForAddress(gt, netip.MustParseAddr("192.168.192.5")); !ok || nic != 2 {
+		t.Fatalf("assigned subnet route selected NIC %d, %t; want NIC 2", nic, ok)
+	}
+}
+
 func TestZeroTierRouteSelectionUsesPrefixMetricAndNetworkID(t *testing.T) {
 	gt := &gtunnel{stack: netstack.NewNetstack(), ztNets: map[string]*zeroTierNetwork{}}
 	for i, id := range []string{"b-network", "a-network", "specific"} {

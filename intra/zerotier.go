@@ -8,6 +8,7 @@ package intra
 
 import (
 	"errors"
+	"net"
 	"net/netip"
 	"sync"
 
@@ -29,6 +30,10 @@ type zeroTierFlowPath struct {
 	tun tunnel.Tunnel
 }
 
+func zeroTierFlowID(src, dst netip.AddrPort) string {
+	return "zerotier:" + src.String() + "=>" + dst.String()
+}
+
 func (z *zeroTierFlowPath) setTunnel(tun tunnel.Tunnel) {
 	z.mu.Lock()
 	z.tun = tun
@@ -40,6 +45,24 @@ func (z *zeroTierFlowPath) contains(addr netip.Addr) bool {
 	tun := z.tun
 	z.mu.RUnlock()
 	return tun != nil && tunnel.HasZeroTierRoute(tun, addr)
+}
+
+func (z *zeroTierFlowPath) owns(addr netip.Addr) bool {
+	z.mu.RLock()
+	tun := z.tun
+	z.mu.RUnlock()
+	return tun != nil && tunnel.ZeroTierOwnsAddress(tun, addr)
+}
+
+func (z *zeroTierFlowPath) openPacketConn(remote netip.Addr) (net.PacketConn, bool, error) {
+	z.mu.RLock()
+	tun := z.tun
+	z.mu.RUnlock()
+	if tun == nil || !tunnel.HasZeroTierRoute(tun, remote) {
+		return nil, false, nil
+	}
+	conn, err := tunnel.DialZeroTierPacketConn(tun, remote)
+	return conn, true, err
 }
 
 func (z *zeroTierFlowPath) dial(network, remote string) (protect.Conn, bool, error) {
