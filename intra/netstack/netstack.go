@@ -15,6 +15,7 @@ import (
 	"github.com/celzero/firestack/intra/settings"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
+	"gvisor.dev/gvisor/pkg/tcpip/network/arp"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -221,7 +222,7 @@ func NewNetstack() (s *stack.Stack) {
 		NetworkProtocols: []stack.NetworkProtocolFactory{
 			ipv4.NewProtocol,
 			ipv6.NewProtocol,
-			// arp.NewProtocol, unused
+			arp.NewProtocol,
 		},
 		TransportProtocols: []stack.TransportProtocolFactory{
 			icmp.NewProtocol4,
@@ -238,4 +239,13 @@ func NewNetstack() (s *stack.Stack) {
 	s = stack.New(o)
 	log.I("netstack: new stack4 and stack6")
 	return
+}
+
+// DefaultRoutes returns the regular dual-stack TUN routes. Callers adding
+// secondary NIC routes should append them to this base table.
+func DefaultRoutes() []tcpip.Route {
+	return []tcpip.Route{
+		{Destination: header.IPv4EmptySubnet, NIC: settings.NICID},
+		{Destination: header.IPv6EmptySubnet, NIC: settings.NICID},
+	}
 }

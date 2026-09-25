@@ -27,9 +27,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -42,6 +46,10 @@ import (
 	"github.com/celzero/firestack/intra/settings"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
+	"gvisor.dev/gvisor/pkg/tcpip/header"
+	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
+	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
@@ -65,6 +73,11 @@ type Tunnel interface {
 	Stat() (*x.NetStat, error)
 }
 
+// ZeroTierBridge passes complete Ethernet frames to the Android ZeroTier node.
+type ZeroTierBridge interface {
+	WriteFrame(networkID string, frame []byte) error
+}
+
 type gtunnel struct {
 	ctx    context.Context
 	done   context.CancelFunc
@@ -75,6 +88,21 @@ type gtunnel struct {
 	pcapio *pcapsink                 // pcap output, if any
 	closed atomic.Bool               // open/close?
 	once   sync.Once
+	ztMu   sync.Mutex
+	ztNets map[string]*zeroTierNetwork
+}
+
+type zeroTierRoute struct {
+	route     tcpip.Route
+	metric    uint32
+	networkID string
+	prefix    netip.Prefix
+}
+type zeroTierNetwork struct {
+	nicID     tcpip.NICID
+	ep        *zeroTierEndpoint
+	addresses []netip.Prefix
+	routes    []zeroTierRoute
 }
 
 var _ Tunnel = (*gtunnel)(nil)
@@ -150,6 +178,11 @@ func (t *gtunnel) Disconnect() {
 	t.once.Do(func() {
 		t.closed.Store(true)
 		// go t.Unlink() // may block? takes more time?
+		t.ztMu.Lock()
+		for _, network := range t.ztNets {
+			network.ep.Close()
+		}
+		t.ztMu.Unlock()
 		t.stack.Destroy()
 		log.I("tun: %d netstack closed", t.sid.Load())
 	})
@@ -280,10 +313,386 @@ func (t *gtunnel) setLink(fd, mtu int) (err error) {
 }
 
 func (t *gtunnel) setRoute(engine int) error {
-	// netstack route is never changed; always dual-stack
-	netstack.Route(t.stack, settings.IP46)
+	t.ztMu.Lock()
+	routes := t.zeroTierRoutesLocked()
+	t.ztMu.Unlock()
+	t.stack.SetRouteTable(routes)
 	log.I("tun: new route; (no-op) got %s but set %s; doing happy eyeballs? %t",
 		settings.L3(engine), settings.IP46, settings.HappyEyeballs.Load())
+	return nil
+}
+
+func (t *gtunnel) configureZeroTier(networkID, mac, addressesCSV, routesCSV string, bridge ZeroTierBridge) error {
+	t.ztMu.Lock()
+	defer t.ztMu.Unlock()
+	if t.closed.Load() {
+		return errors.New("tunnel closed")
+	}
+	if strings.TrimSpace(networkID) == "" {
+		return errors.New("zerotier network id is empty")
+	}
+	if bridge == nil {
+		return errors.New("zerotier bridge is nil")
+	}
+	addresses, err := parsePrefixes(addressesCSV)
+	if err != nil {
+		return err
+	}
+	routes, err := parseRoutes(routesCSV)
+	if err != nil {
+		return err
+	}
+	network := t.ztNets[networkID]
+	if network == nil {
+		nicID := t.nextZeroTierNICIDLocked()
+		if nicID == 0 {
+			return errors.New("no free NIC id for ZeroTier")
+		}
+		ep, err := newZeroTierEndpoint(networkID, mac, uint32(t.ep.MTU()), bridge)
+		if err != nil {
+			return err
+		}
+		if err := t.stack.CreateNIC(nicID, ep); err != nil {
+			ep.Close()
+			return errors.New(err.String())
+		}
+		if err := t.stack.SetSpoofing(nicID, true); err != nil {
+			t.stack.RemoveNIC(nicID)
+			ep.Close()
+			return errors.New(err.String())
+		}
+		if err := t.stack.SetPromiscuousMode(nicID, true); err != nil {
+			t.stack.RemoveNIC(nicID)
+			ep.Close()
+			return errors.New(err.String())
+		}
+		network = &zeroTierNetwork{nicID: nicID, ep: ep}
+		if t.ztNets == nil {
+			t.ztNets = make(map[string]*zeroTierNetwork)
+		}
+		t.ztNets[networkID] = network
+	} else if err := network.ep.setMAC(mac); err != nil {
+		return err
+	}
+	if err := t.stack.SetNICAddress(network.nicID, network.ep.LinkAddress()); err != nil {
+		return errors.New(err.String())
+	}
+	if err := network.ep.setBridge(bridge); err != nil {
+		return err
+	}
+	if err := replaceZeroTierAddresses(t.stack, network.nicID, addresses); err != nil {
+		return err
+	}
+	ztRoutes, err := routesForNIC(routes, network.nicID)
+	if err != nil {
+		return err
+	}
+	network.addresses = addresses
+	network.routes = make([]zeroTierRoute, 0, len(ztRoutes))
+	for i, r := range ztRoutes {
+		network.routes = append(network.routes, zeroTierRoute{route: r, metric: routes[i].metric, networkID: networkID, prefix: routes[i].prefix})
+	}
+	t.stack.SetRouteTable(t.zeroTierRoutesLocked())
+	return nil
+}
+
+func (t *gtunnel) nextZeroTierNICIDLocked() tcpip.NICID {
+	for id := firstZeroTierNICID; id < tcpip.NICID(0xffff); id++ {
+		if !t.stack.CheckNIC(id) {
+			return id
+		}
+	}
+	return 0
+}
+
+func (t *gtunnel) zeroTierRoutesLocked() []tcpip.Route {
+	var entries []zeroTierRoute
+	default4, default6 := false, false
+	for _, network := range t.ztNets {
+		for _, route := range network.routes {
+			entries = append(entries, route)
+			if route.prefix.Bits() == 0 && route.prefix.Addr().Is4() {
+				default4 = true
+			}
+			if route.prefix.Bits() == 0 && route.prefix.Addr().Is6() {
+				default6 = true
+			}
+		}
+		for _, addr := range network.addresses {
+			routes, err := routesForNIC([]routeSpec{{prefix: addr}}, network.nicID)
+			if err == nil {
+				entries = append(entries, zeroTierRoute{route: routes[0], networkID: networkIDFromNic(t.ztNets, network.nicID), prefix: addr})
+			}
+		}
+	}
+	sort.SliceStable(entries, func(i, j int) bool {
+		if entries[i].prefix.Bits() != entries[j].prefix.Bits() {
+			return entries[i].prefix.Bits() > entries[j].prefix.Bits()
+		}
+		if entries[i].metric != entries[j].metric {
+			return entries[i].metric < entries[j].metric
+		}
+		return entries[i].networkID < entries[j].networkID
+	})
+	base := netstack.DefaultRoutes()
+	if default4 {
+		base = removeDefaultRoute(base, header.IPv4EmptySubnet)
+	}
+	if default6 {
+		base = removeDefaultRoute(base, header.IPv6EmptySubnet)
+	}
+	for _, entry := range entries {
+		base = append(base, entry.route)
+	}
+	return base
+}
+
+func networkIDFromNic(nets map[string]*zeroTierNetwork, nic tcpip.NICID) string {
+	for id, network := range nets {
+		if network.nicID == nic {
+			return id
+		}
+	}
+	return ""
+}
+
+func removeDefaultRoute(routes []tcpip.Route, dst tcpip.Subnet) []tcpip.Route {
+	for i := range routes {
+		if routes[i].Destination == dst {
+			return append(routes[:i], routes[i+1:]...)
+		}
+	}
+	return routes
+}
+
+func (t *gtunnel) injectZeroTierFrame(networkID string, frame []byte) error {
+	t.ztMu.Lock()
+	network := t.ztNets[networkID]
+	t.ztMu.Unlock()
+	if network == nil {
+		return errors.New("zerotier network is not configured")
+	}
+	return network.ep.injectFrame(frame)
+}
+
+func (t *gtunnel) clearZeroTier(networkID string) error {
+	t.ztMu.Lock()
+	defer t.ztMu.Unlock()
+	network := t.ztNets[networkID]
+	if network == nil {
+		return nil
+	}
+	delete(t.ztNets, networkID)
+	t.stack.SetRouteTable(t.zeroTierRoutesLocked())
+	if err := t.stack.RemoveNIC(network.nicID); err != nil {
+		return errors.New(err.String())
+	}
+	network.ep.Close()
+	return nil
+}
+
+// ConfigureZeroTier configures the private secondary NIC without adding SDK
+// types or gVisor types to Intra's public gomobile interface.
+func ConfigureZeroTier(t Tunnel, networkID, mac, addressesCSV, routesCSV string, bridge ZeroTierBridge) error {
+	gt, ok := t.(*gtunnel)
+	if !ok {
+		return errors.New("tunnel does not support ZeroTier")
+	}
+	return gt.configureZeroTier(networkID, mac, addressesCSV, routesCSV, bridge)
+}
+
+func InjectZeroTierFrame(t Tunnel, networkID string, frame []byte) error {
+	gt, ok := t.(*gtunnel)
+	if !ok {
+		return errors.New("tunnel does not support ZeroTier")
+	}
+	return gt.injectZeroTierFrame(networkID, frame)
+}
+
+func ClearZeroTier(t Tunnel, networkID string) error {
+	gt, ok := t.(*gtunnel)
+	if !ok {
+		return errors.New("tunnel does not support ZeroTier")
+	}
+	return gt.clearZeroTier(networkID)
+}
+
+func HasZeroTierRoute(t Tunnel, addr netip.Addr) bool {
+	_, ok := t.(*gtunnel)
+	if !ok || !addr.IsValid() {
+		return false
+	}
+	_, ok = ZeroTierNICForAddress(t, addr)
+	return ok
+}
+
+func ZeroTierNICForAddress(t Tunnel, addr netip.Addr) (tcpip.NICID, bool) {
+	gt, ok := t.(*gtunnel)
+	if !ok || !addr.IsValid() {
+		return 0, false
+	}
+	gt.ztMu.Lock()
+	defer gt.ztMu.Unlock()
+	bestBits, bestMetric, bestID := -1, uint32(^uint32(0)), ""
+	var bestNIC tcpip.NICID
+	check := func(prefix netip.Prefix, metric uint32, id string, nic tcpip.NICID) {
+		if !prefix.Contains(addr) {
+			return
+		}
+		if prefix.Bits() > bestBits || prefix.Bits() == bestBits && (metric < bestMetric || metric == bestMetric && (bestID == "" || id < bestID)) {
+			bestBits, bestMetric, bestID, bestNIC = prefix.Bits(), metric, id, nic
+		}
+	}
+	for id, network := range gt.ztNets {
+		for _, route := range network.routes {
+			check(route.prefix, route.metric, id, network.nicID)
+		}
+		for _, address := range network.addresses {
+			check(address, 0, id, network.nicID)
+		}
+	}
+	return bestNIC, bestBits >= 0
+}
+
+// DialZeroTier opens a TCP or UDP flow directly on the secondary NIC. Intra
+// calls this only after its normal firewall and proxy-selection checks pass.
+func DialZeroTier(t Tunnel, network, remote string) (net.Conn, error) {
+	gt, ok := t.(*gtunnel)
+	if !ok {
+		return nil, errors.New("tunnel does not support ZeroTier")
+	}
+	addr, proto := fulladdr(remote)
+	if addr == nil {
+		return nil, fmt.Errorf("invalid ZeroTier destination %q", remote)
+	}
+	ipp, err := netip.ParseAddrPort(remote)
+	if err != nil {
+		return nil, err
+	}
+	addr.NIC, ok = ZeroTierNICForAddress(t, ipp.Addr())
+	if !ok {
+		return nil, fmt.Errorf("no ZeroTier route to %s", ipp.Addr())
+	}
+	switch network {
+	case "tcp", "tcp4", "tcp6":
+		return gonet.DialTCP(gt.stack, *addr, proto)
+	case "udp", "udp4", "udp6":
+		return gonet.DialUDP(gt.stack, nil, addr, proto)
+	default:
+		return nil, net.UnknownNetworkError(network)
+	}
+}
+
+func parsePrefixes(csv string) ([]netip.Prefix, error) {
+	var out []netip.Prefix
+	for _, item := range strings.Split(csv, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		p, err := netip.ParsePrefix(item)
+		if err != nil {
+			return nil, fmt.Errorf("invalid prefix %q: %w", item, err)
+		}
+		out = append(out, p.Masked())
+	}
+	return out, nil
+}
+
+type routeSpec struct {
+	prefix  netip.Prefix
+	gateway netip.Addr
+	metric  uint32
+}
+
+func parseRoutes(csv string) ([]routeSpec, error) {
+	var out []routeSpec
+	for _, item := range strings.Split(csv, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		metric := uint32(0)
+		if i := strings.LastIndexByte(item, '@'); i >= 0 {
+			v, err := strconv.ParseUint(strings.TrimSpace(item[i+1:]), 10, 32)
+			if err != nil {
+				return nil, fmt.Errorf("invalid route metric %q", item[i+1:])
+			}
+			metric, item = uint32(v), item[:i]
+		}
+		parts := strings.Split(item, "=")
+		if len(parts) > 2 {
+			return nil, fmt.Errorf("invalid route %q", item)
+		}
+		p, err := netip.ParsePrefix(strings.TrimSpace(parts[0]))
+		if err != nil {
+			return nil, fmt.Errorf("invalid route prefix %q: %w", parts[0], err)
+		}
+		r := routeSpec{prefix: p.Masked(), metric: metric}
+		if len(parts) == 2 {
+			r.gateway, err = netip.ParseAddr(strings.TrimSpace(parts[1]))
+			if err != nil || r.gateway.Is4() != p.Addr().Is4() {
+				return nil, fmt.Errorf("invalid route gateway %q", parts[1])
+			}
+		}
+		out = append(out, r)
+	}
+	return out, nil
+}
+
+func routesForNIC(prefixes []routeSpec, nic tcpip.NICID) ([]tcpip.Route, error) {
+	out := make([]tcpip.Route, 0, len(prefixes))
+	for _, route := range prefixes {
+		p := route.prefix
+		addr := tcpip.Address{}
+		bits := 0
+		if p.Addr().Is4() {
+			addr = tcpip.AddrFrom4(p.Addr().As4())
+			bits = 32
+		} else {
+			addr = tcpip.AddrFrom16(p.Addr().As16())
+			bits = 128
+		}
+		mask := tcpip.MaskFromBytes(net.CIDRMask(p.Bits(), bits))
+		dst, err := tcpip.NewSubnet(addr, mask)
+		if err != nil {
+			return nil, fmt.Errorf("invalid route %s: %w", p, err)
+		}
+		var gateway tcpip.Address
+		if route.gateway.IsValid() {
+			gateway = tcpip.AddrFromSlice(route.gateway.AsSlice())
+		}
+		out = append(out, tcpip.Route{Destination: dst, Gateway: gateway, NIC: nic})
+	}
+	return out, nil
+}
+
+func replaceZeroTierAddresses(s *stack.Stack, nicID tcpip.NICID, prefixes []netip.Prefix) error {
+	for id, info := range s.NICInfo() {
+		if id != nicID {
+			continue
+		}
+		for _, addr := range info.ProtocolAddresses {
+			if err := s.RemoveAddress(nicID, addr.AddressWithPrefix.Address); err != nil {
+				return errors.New(err.String())
+			}
+		}
+	}
+	for _, p := range prefixes {
+		var proto tcpip.NetworkProtocolNumber
+		var addr tcpip.Address
+		if p.Addr().Is4() {
+			proto = ipv4.ProtocolNumber
+			addr = tcpip.AddrFrom4(p.Addr().As4())
+		} else {
+			proto = ipv6.ProtocolNumber
+			addr = tcpip.AddrFrom16(p.Addr().As16())
+		}
+		pa := tcpip.ProtocolAddress{Protocol: proto, AddressWithPrefix: tcpip.AddressWithPrefix{Address: addr, PrefixLen: p.Bits()}}
+		if err := s.AddProtocolAddress(nicID, pa, stack.AddressProperties{PEB: stack.CanBePrimaryEndpoint}); err != nil {
+			return errors.New(err.String())
+		}
+	}
 	return nil
 }
 
