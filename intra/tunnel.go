@@ -271,6 +271,9 @@ func NewTunnel2(fd, linkmtu, tunmtu int, ifaddrs, fakedns string, dtr DefaultDNS
 	icmph := NewICMPHandler(ctx, resolver, proxies, bdg)
 	hdl := netstack.NewGConnHandler(src, tcph, udph, icmph)
 	ztFlow := &zeroTierFlowPath{}
+	if h, ok := icmph.(*icmpHandler); ok {
+		h.ztFlow = ztFlow
+	}
 	if h, ok := tcph.(*tcpHandler); ok {
 		h.ztFlow = ztFlow
 	}

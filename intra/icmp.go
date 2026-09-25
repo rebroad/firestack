@@ -25,6 +25,7 @@ import (
 type icmpHandler struct {
 	*baseHandler
 	staller *core.ExpMap[netip.AddrPort, string] // src(addr:port) -> stallSecs
+	ztFlow  *zeroTierFlowPath
 }
 
 var _ netstack.GICMPHandler = (*icmpHandler)(nil)
@@ -67,6 +68,10 @@ func (h *icmpHandler) maybeStall(src netip.AddrPort) (secs uint32) {
 // see: sturmflut.github.io/linux/ubuntu/2015/01/17/unprivileged-icmp-sockets-on-linux/
 // ex: github.com/prometheus-community/pro-bing/blob/0bacb2d5e/ping.go#L703
 func (h *icmpHandler) Ping(msg []byte, source, target netip.AddrPort) (echoed bool) {
+	if h.ztFlow != nil && h.ztFlow.contains(target.Addr()) {
+		return h.forwardZeroTier(msg, source, target)
+	}
+
 	var px ipn.Proxy = nil
 	var err error
 	var tx, rx int
@@ -174,4 +179,43 @@ func (h *icmpHandler) Ping(msg []byte, source, target netip.AddrPort) (echoed bo
 
 	// TODO: on timeout errs, return false?
 	return true // echoed
+}
+
+// forwardZeroTier routes ICMP on the NIC selected by the destination prefix,
+// without passing it through Rethink's firewall or proxy chain.
+func (h *icmpHandler) forwardZeroTier(msg []byte, source, target netip.AddrPort) (echoed bool) {
+	smm := icmpSummary(zeroTierFlowID(source, target), UNKNOWN_UID_STR)
+	smm.PID = "ZeroTier"
+	smm.Target = target.Addr().String()
+	var tx, rx int
+	var rtt time.Duration
+	var err error
+	defer func() {
+		smm.Tx, smm.Rx = int64(tx), int64(rx)
+		smm.Rtt = rtt.Milliseconds()
+		h.queueSummary(smm.done(err))
+	}()
+
+	if h.status.Load() == HDLEND {
+		err = log.EE("t.icmp: handler ended (%s => %s)", source, target)
+		return false
+	}
+	if h.ztFlow.owns(target.Addr()) {
+		tx, rx = len(msg), len(msg)
+		return true
+	}
+	pc, selected, dialErr := h.ztFlow.openPacketConn(target.Addr())
+	if !selected || dialErr != nil || pc == nil {
+		err = core.OneErr(dialErr, unix.ENETUNREACH)
+		return false
+	}
+	defer core.Close(pc)
+	tx = len(msg)
+	started := time.Now()
+	var reply []byte
+	reply, _, err = core.Echo(pc, msg, net.UDPAddrFromAddrPort(netip.AddrPortFrom(target.Addr(), 0)), target.Addr().Is4())
+	rtt = time.Since(started)
+	rx = len(reply)
+	echoed = err == nil
+	return echoed
 }

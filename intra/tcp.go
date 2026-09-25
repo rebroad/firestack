@@ -260,6 +260,34 @@ func (h *tcpHandler) Proxy(gconn *netstack.GTCPConn, src, target netip.AddrPort)
 		clos(gconn) // gconn may be nil
 		return deny
 	}
+	if h.status.Load() == HDLEND {
+		clos(gconn)
+		return deny
+	}
+	if h.ztFlow != nil && h.ztFlow.contains(target.Addr()) && !h.ztFlow.owns(target.Addr()) {
+		smm = tcpSummary(zeroTierFlowID(src, target), UNKNOWN_UID_STR, src.Addr(), target.Addr())
+		smm.PID = "ZeroTier"
+		smm.Target = target.Addr().String()
+		started := time.Now()
+		pc, _, dialErr := h.ztFlow.dial("tcp", target.String())
+		if dialErr != nil || pc == nil {
+			err = core.OneErr(dialErr, errTcpNoTarget)
+			clos(gconn, pc)
+			h.queueSummary(smm.done(err))
+			return deny
+		}
+		smm.Rtt = time.Since(started).Milliseconds()
+		if _, err = h.handshakeIfNeededOrClose(gconn, smm); err != nil {
+			clos(pc)
+			h.queueSummary(smm.done(err))
+			return deny
+		}
+		core.Go("tcp.zerotier."+smm.ID, func() {
+			h.flowing(smm)
+			h.forward(gconn, rwext{pc, tcptimeout}, smm)
+		})
+		return allow
+	}
 
 	// flow/dns-override are nat-aware, as in, they can deal with
 	// nat-ed ips just fine, and so, use target as-is instead of ipx4
@@ -397,7 +425,7 @@ func (h *tcpHandler) handle(px ipn.Proxy, gconn *netstack.GTCPConn, src, target 
 	cont = true
 	stop := !cont
 	targetstr := target.String()
-	useZeroTier := h.ztFlow != nil && zeroTierDirectProxy(px, smm.RPID) && h.ztFlow.contains(target.Addr())
+	useZeroTier := h.ztFlow != nil && zeroTierDirectProxy(px, smm.RPID) && h.ztFlow.contains(target.Addr()) && !h.ztFlow.owns(target.Addr())
 
 	if errOnNoRoute && !useZeroTier {
 		if canroute := px.Router().Contains(smm.ID, targetstr); !canroute {

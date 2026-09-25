@@ -419,7 +419,8 @@ func (t *gtunnel) zeroTierRoutesLocked() []tcpip.Route {
 			}
 		}
 		for _, addr := range network.addresses {
-			routes, err := routesForNIC([]routeSpec{{prefix: addr}}, network.nicID)
+			// Interface addresses retain host bits; their subnet route must be masked.
+			routes, err := routesForNIC([]routeSpec{{prefix: addr.Masked()}}, network.nicID)
 			if err == nil {
 				entries = append(entries, zeroTierRoute{route: routes[0], networkID: networkIDFromNic(t.ztNets, network.nicID), prefix: addr})
 			}
@@ -548,14 +549,32 @@ func ZeroTierNICForAddress(t Tunnel, addr netip.Addr) (tcpip.NICID, bool) {
 			check(route.prefix, route.metric, id, network.nicID)
 		}
 		for _, address := range network.addresses {
-			check(address, 0, id, network.nicID)
+			check(address.Masked(), 0, id, network.nicID)
 		}
 	}
 	return bestNIC, bestBits >= 0
 }
 
-// DialZeroTier opens a TCP or UDP flow directly on the secondary NIC. Intra
-// calls this only after its normal firewall and proxy-selection checks pass.
+// ZeroTierOwnsAddress reports whether addr is assigned to a ZeroTier NIC.
+func ZeroTierOwnsAddress(t Tunnel, addr netip.Addr) bool {
+	gt, ok := t.(*gtunnel)
+	if !ok || !addr.IsValid() {
+		return false
+	}
+	gt.ztMu.Lock()
+	defer gt.ztMu.Unlock()
+	for _, network := range gt.ztNets {
+		for _, assigned := range network.addresses {
+			if assigned.Addr() == addr {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// DialZeroTier opens a TCP or UDP flow directly on the secondary NIC selected
+// by the destination's ZeroTier route.
 func DialZeroTier(t Tunnel, network, remote string) (net.Conn, error) {
 	gt, ok := t.(*gtunnel)
 	if !ok {
@@ -583,6 +602,20 @@ func DialZeroTier(t Tunnel, network, remote string) (net.Conn, error) {
 	}
 }
 
+// DialZeroTierPacketConn opens a packet endpoint on the NIC selected by the
+// destination's ZeroTier route. ICMP uses this for native packet forwarding.
+func DialZeroTierPacketConn(t Tunnel, remote netip.Addr) (net.PacketConn, error) {
+	gt, ok := t.(*gtunnel)
+	if !ok {
+		return nil, errors.New("tunnel does not support ZeroTier")
+	}
+	nic, ok := ZeroTierNICForAddress(t, remote)
+	if !ok {
+		return nil, fmt.Errorf("no ZeroTier route to %s", remote)
+	}
+	return netstack.DialPingAddr(gt.stack, nic, netip.Addr{}, remote)
+}
+
 func parsePrefixes(csv string) ([]netip.Prefix, error) {
 	var out []netip.Prefix
 	for _, item := range strings.Split(csv, ",") {
@@ -594,7 +627,10 @@ func parsePrefixes(csv string) ([]netip.Prefix, error) {
 		if err != nil {
 			return nil, fmt.Errorf("invalid prefix %q: %w", item, err)
 		}
-		out = append(out, p.Masked())
+		// Assigned addresses must retain their host bits (for example,
+		// 192.168.192.7/24). Route prefixes are masked separately in
+		// parseRoutes; masking an interface address would assign .0 here.
+		out = append(out, p)
 	}
 	return out, nil
 }
