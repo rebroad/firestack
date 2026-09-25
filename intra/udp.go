@@ -43,7 +43,8 @@ import (
 
 type udpHandler struct {
 	*baseHandler
-	mux *muxTable // EIM/EIF table
+	mux    *muxTable // EIM/EIF table
+	ztFlow *zeroTierFlowPath
 }
 
 var (
@@ -360,9 +361,13 @@ func (h *udpHandler) Connect(gconn *netstack.GUDPConn, src, target netip.AddrPor
 		pxid = smm.PID
 		canportfwd = portfwd && ipn.Remote(pxid)
 
+		ztSelected := false
+		if !mux && h.ztFlow != nil && zeroTierDirectProxy(px, smm.RPID) {
+			pc, ztSelected, err = h.ztFlow.dial("udp", selectedTarget.String())
+		}
 		if mux { // mux is not supported by all proxies (few like Exit, Base, WG support it)
 			pc, err = h.mux.associate(cid, pxid, uid, src, selectedTarget, px.Dialer().Announce, vendor(dmx), canportfwd)
-		} else {
+		} else if !ztSelected {
 			if log.Verbose {
 				log.VV("udp: connect: #%d: attempt: %s [%s] proxy(%s) to dst(%s); mux? %t / fwd? %t",
 					i, cid, uid, pxid, selectedTarget, mux, canportfwd)

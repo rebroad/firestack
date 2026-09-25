@@ -114,8 +114,27 @@ type Tunnel interface {
 	// If len(fpcap) is 0, no PCAP file will be written.
 	// If len(fpcap) is 1, PCAP be written to stdout.
 	SetPcap(fpcap string) error
+	// ConfigureZeroTier binds a ZeroTier network to its secondary Ethernet NIC.
+	// Prefix lists are comma-separated CIDRs; routes may use =gateway and @metric.
+	ConfigureZeroTier(networkID, mac, addressesCSV, routesCSV string, bridge ZeroTierBridge) error
+	// InjectZeroTierFrame delivers a complete Ethernet frame from ZeroTier.
+	InjectZeroTierFrame(networkID string, frame []byte) error
+	// ClearZeroTier removes the named ZeroTier NIC and its configuration.
+	ClearZeroTier(networkID string) error
 	// NIC, IP, TCP, UDP, and ICMP stats.
 	Stat() (*x.NetStat, error)
+}
+
+// ZeroTierBridge is the callback from the netstack to the Android ZeroTier
+// engine. The callback receives one complete Ethernet frame per call.
+type ZeroTierBridge interface {
+	WriteFrame(networkID string, frame []byte) error
+}
+
+type zeroTierBridgeAdapter struct{ bridge ZeroTierBridge }
+
+func (a zeroTierBridgeAdapter) WriteFrame(networkID string, frame []byte) error {
+	return a.bridge.WriteFrame(networkID, frame)
 }
 
 type rtunnel struct {
@@ -125,10 +144,13 @@ type rtunnel struct {
 	t   core.Volatile[tunnel.Tunnel]
 	bar *core.Barrier[*x.NetStat, string]
 
-	handlers netstack.GConnHandler
-	proxies  ipn.Proxies
-	resolver dnsx.Resolver
-	services rnet.Services
+	handlers   netstack.GConnHandler
+	proxies    ipn.Proxies
+	resolver   dnsx.Resolver
+	services   rnet.Services
+	ztFlow     *zeroTierFlowPath
+	ztConfigMu sync.Mutex
+	ztConfig   map[string]zeroTierConfig
 
 	linkmtu atomic.Int32
 
@@ -248,6 +270,13 @@ func NewTunnel2(fd, linkmtu, tunmtu int, ifaddrs, fakedns string, dtr DefaultDNS
 	udph := NewUDPHandler(ctx, resolver, proxies, bdg)
 	icmph := NewICMPHandler(ctx, resolver, proxies, bdg)
 	hdl := netstack.NewGConnHandler(src, tcph, udph, icmph)
+	ztFlow := &zeroTierFlowPath{}
+	if h, ok := tcph.(*tcpHandler); ok {
+		h.ztFlow = ztFlow
+	}
+	if h, ok := udph.(*udpHandler); ok {
+		h.ztFlow = ztFlow
+	}
 
 	log.D("tun: <<< new >>>; protocol handlers: ok")
 
@@ -271,8 +300,10 @@ func NewTunnel2(fd, linkmtu, tunmtu int, ifaddrs, fakedns string, dtr DefaultDNS
 		proxies:  proxies,
 		resolver: resolver,
 		services: services,
+		ztFlow:   ztFlow,
 	}
 	rt.t.Store(gt)
+	ztFlow.setTunnel(gt)
 	rt.linkmtu.Store(int32(linkmtu))
 
 	context.AfterFunc(ctx, wire.Pool.Clear)
@@ -386,12 +417,22 @@ func (t *rtunnel) Restart(fd, linkmtu, tunmtu, engine int) error {
 		log.W("tun: <<< restart >>>; for: %d, new? %t / mtu? %d; err(%v)", fd, tunmtu, gt != nil, err)
 		return core.OneErr(err, errMakeTunnel)
 	}
+	t.ztConfigMu.Lock()
+	for networkID, cfg := range t.ztConfig {
+		if zerr := tunnel.ConfigureZeroTier(gt, networkID, cfg.mac, cfg.addresses, cfg.routes, zeroTierBridgeAdapter{cfg.bridge}); zerr != nil {
+			t.ztConfigMu.Unlock()
+			gt.Disconnect()
+			return zerr
+		}
+	}
+	t.ztConfigMu.Unlock()
 
 	if !t.t.Cas(old, gt) { // gt never nil
 		gt.Disconnect() // close the new tunnel
 		log.E("tun: <<< restart >>>; for: %d (mtu: %d), cas failed; old %X, new %X", fd, tunmtu, old, gt)
 		return nil
 	}
+	t.ztFlow.setTunnel(gt)
 
 	// TODO: err on reverser errors too?
 	rerr := t.proxies.Reverser(revhdl)

@@ -45,7 +45,8 @@ import (
 
 type tcpHandler struct {
 	*baseHandler
-	nat *tcpNat
+	nat    *tcpNat
+	ztFlow *zeroTierFlowPath
 }
 
 // TODO: replace with ExpMap
@@ -396,8 +397,9 @@ func (h *tcpHandler) handle(px ipn.Proxy, gconn *netstack.GTCPConn, src, target 
 	cont = true
 	stop := !cont
 	targetstr := target.String()
+	useZeroTier := h.ztFlow != nil && zeroTierDirectProxy(px, smm.RPID) && h.ztFlow.contains(target.Addr())
 
-	if errOnNoRoute {
+	if errOnNoRoute && !useZeroTier {
 		if canroute := px.Router().Contains(smm.ID, targetstr); !canroute {
 			// make sure to not delay in HappyEyeballs scenario?
 			return cont, log.WE("proxy(%s) has no route to %s (<= %s)", pidstr(px), targetstr, src)
@@ -431,13 +433,16 @@ func (h *tcpHandler) handle(px ipn.Proxy, gconn *netstack.GTCPConn, src, target 
 	// github.com/google/gvisor/blob/5ba35f516b5c2/test/benchmarks/tcp/tcp_proxy.go#L359
 	// ref: stackoverflow.com/questions/63656117
 	// ref: stackoverflow.com/questions/40328025
-	if bindAddr.IsValid() {
+	if useZeroTier {
+		pc, _, err = h.ztFlow.dial("tcp", targetstr)
+		dialbindOK = err == nil
+	} else if bindAddr.IsValid() {
 		pc, err = px.Dialer().DialBind("tcp", bindAddr.String(), targetstr)
 		dialbindOK = err == nil
 		logwif(!dialbindOK)("tcp: %s dialbind ok? %t (%s [%s] => %s via %s); err? %v",
 			smm.ID, dialbindOK, src, bindAddr, targetstr, pid, err)
 	}
-	if !dialbindOK {
+	if !dialbindOK && !useZeroTier {
 		pc, err = px.Dialer().Dial("tcp", targetstr)
 	}
 	if err == nil {
