@@ -425,9 +425,14 @@ func (h *tcpHandler) handle(px ipn.Proxy, gconn *netstack.GTCPConn, src, target 
 	cont = true
 	stop := !cont
 	targetstr := target.String()
+	localService := h.ztFlow != nil && h.ztFlow.owns(target.Addr())
+	dialTarget := target
+	if localService {
+		dialTarget, _ = zeroTierLocalServiceTarget(target)
+	}
 	useZeroTier := h.ztFlow != nil && zeroTierDirectProxy(px, smm.RPID) && h.ztFlow.contains(target.Addr()) && !h.ztFlow.owns(target.Addr())
 
-	if errOnNoRoute && !useZeroTier {
+	if errOnNoRoute && !useZeroTier && !localService {
 		if canroute := px.Router().Contains(smm.ID, targetstr); !canroute {
 			// make sure to not delay in HappyEyeballs scenario?
 			return cont, log.WE("proxy(%s) has no route to %s (<= %s)", pidstr(px), targetstr, src)
@@ -440,10 +445,10 @@ func (h *tcpHandler) handle(px ipn.Proxy, gconn *netstack.GTCPConn, src, target 
 	portfwd := settings.PortForward.Load()
 	canportfwd := portfwd && ipn.Remote(pid)
 
-	if eim { // bindAddr may be invalid
+	if eim && !localService { // bindAddr may be invalid
 		bindAddr = h.natLookup(pid, src, target)
 	}
-	if !bindAddr.IsValid() && canportfwd { // port forwarding overriden by eim
+	if !localService && !bindAddr.IsValid() && canportfwd { // port forwarding overriden by eim
 		bindAddr = makeAnyAddrPort(src)
 	}
 
@@ -465,13 +470,13 @@ func (h *tcpHandler) handle(px ipn.Proxy, gconn *netstack.GTCPConn, src, target 
 		pc, _, err = h.ztFlow.dial("tcp", targetstr)
 		dialbindOK = err == nil
 	} else if bindAddr.IsValid() {
-		pc, err = px.Dialer().DialBind("tcp", bindAddr.String(), targetstr)
+		pc, err = px.Dialer().DialBind("tcp", bindAddr.String(), dialTarget.String())
 		dialbindOK = err == nil
 		logwif(!dialbindOK)("tcp: %s dialbind ok? %t (%s [%s] => %s via %s); err? %v",
 			smm.ID, dialbindOK, src, bindAddr, targetstr, pid, err)
 	}
 	if !dialbindOK && !useZeroTier {
-		pc, err = px.Dialer().Dial("tcp", targetstr)
+		pc, err = px.Dialer().Dial("tcp", dialTarget.String())
 	}
 	if err == nil {
 		smm.Rtt = time.Since(start).Milliseconds()
