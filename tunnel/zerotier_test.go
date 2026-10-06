@@ -127,6 +127,38 @@ func TestZeroTierRouteSelectionUsesPrefixMetricAndNetworkID(t *testing.T) {
 	}
 }
 
+func TestZeroTierDefaultRouteIsInstalledOnlyWhenAdvertised(t *testing.T) {
+	base := netstack.DefaultRoutes()
+	hasDefault := func(routes []tcpip.Route, subnet tcpip.Subnet) bool {
+		for _, route := range routes {
+			if route.Destination == subnet {
+				return true
+			}
+		}
+		return false
+	}
+
+	gt := &gtunnel{ztNets: map[string]*zeroTierNetwork{}}
+	if got := gt.zeroTierRoutesLocked(); !hasDefault(got, header.IPv4EmptySubnet) || !hasDefault(got, header.IPv6EmptySubnet) {
+		t.Fatalf("without advertised defaults, route table %v should retain base IPv4/IPv6 defaults %v", got, base)
+	}
+
+	const networkID = "advertised-default"
+	const nic tcpip.NICID = 7
+	gt.ztNets[networkID] = &zeroTierNetwork{nicID: nic, routes: []zeroTierRoute{
+		{route: tcpip.Route{Destination: header.IPv4EmptySubnet, NIC: nic}, networkID: networkID, prefix: netip.MustParsePrefix("0.0.0.0/0")},
+	}}
+	got := gt.zeroTierRoutesLocked()
+	if !hasDefault(got, header.IPv4EmptySubnet) || !hasDefault(got, header.IPv6EmptySubnet) {
+		t.Fatalf("advertising IPv4 default should route IPv4 through ZeroTier and preserve IPv6 default: %v", got)
+	}
+	for _, route := range got {
+		if route.Destination == header.IPv4EmptySubnet && route.NIC != nic {
+			t.Fatalf("IPv4 default uses NIC %d; want ZeroTier NIC %d", route.NIC, nic)
+		}
+	}
+}
+
 func TestZeroTierUDPFlowEmitsRoutedEthernetFrame(t *testing.T) {
 	const (
 		nwid       = "0123456789abcdef"
