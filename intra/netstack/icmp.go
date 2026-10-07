@@ -7,6 +7,8 @@
 package netstack
 
 import (
+	"net/netip"
+
 	"github.com/celzero/firestack/intra/core"
 	"github.com/celzero/firestack/intra/log"
 	"github.com/celzero/firestack/intra/settings"
@@ -21,6 +23,14 @@ import (
 type GICMPHandler interface {
 	GBaseConnHandler
 	GEchoConnHandler
+}
+
+// GDefaultEchoReplyHandler lets a handler defer a local echo request to
+// gVisor's built-in responder. gVisor normally sends its own echo reply after
+// delivering the packet to the custom handler, so custom replies would be
+// duplicated for addresses owned by the stack.
+type GDefaultEchoReplyHandler interface {
+	UseDefaultEchoReply(src, dst netip.AddrPort) bool
 }
 
 type icmpForwarder struct {
@@ -67,9 +77,6 @@ func (f *icmpForwarder) reply4(id stack.TransportEndpointID, pkt *stack.PacketBu
 		return // not handled
 	}
 
-	src := remoteAddrPort(id)
-	dst := localAddrPort(id)
-
 	l4hdr := pkt.TransportHeader().Slice()
 	l3hdr := pkt.NetworkHeader().Slice()
 	if len(l4hdr) < header.ICMPv4MinimumSize || len(l3hdr) < header.IPv4MinimumSize {
@@ -83,6 +90,11 @@ func (f *icmpForwarder) reply4(id stack.TransportEndpointID, pkt *stack.PacketBu
 		// netstack handles other msgs except echo / ping
 		log.D("icmp: v4: %s: type %v passthrough", f.o, hdr.Type())
 		return // not handled
+	}
+	src := remoteAddrPort(id)
+	dst := localAddrPort(id)
+	if h, ok := f.h.(GDefaultEchoReplyHandler); ok && h.UseDefaultEchoReply(src, dst) {
+		return true // let gVisor send the sole echo reply
 	}
 	// consult the stack-wide ICMP rate limiter; see: stackopts.go:SetNetstackOpts
 	// github.com/google/gvisor/blob/738e1d995f/pkg/tcpip/network/ipv4/icmp.go
@@ -201,6 +213,11 @@ func (f *icmpForwarder) reply6(id stack.TransportEndpointID, pkt *stack.PacketBu
 		log.D("icmp: v6: %s: type %v/%v passthrough", f.o, hdr.Type(), hdr.Code())
 		return // netstack to handle other msgs except echo / ping
 	}
+	src := remoteAddrPort(id)
+	dst := localAddrPort(id)
+	if h, ok := f.h.(GDefaultEchoReplyHandler); ok && h.UseDefaultEchoReply(src, dst) {
+		return true // let gVisor send the sole echo reply
+	}
 
 	l3 := pkt.Network() // l3.Dst == id.LocalAddr and l3.Src == id.RemoteAddr
 
@@ -217,8 +234,6 @@ func (f *icmpForwarder) reply6(id stack.TransportEndpointID, pkt *stack.PacketBu
 		return // not handled
 	}
 
-	src := remoteAddrPort(id)
-	dst := localAddrPort(id)
 	// github.com/google/gvisor/blob/9b4a7aa00/pkg/tcpip/network/ipv6/icmp.go#L1180
 	data, derr := l4l7(pkt, route.MTU())
 	if derr != nil || len(data) <= 0 {
