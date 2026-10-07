@@ -58,6 +58,13 @@ func (h *icmpHandler) maybeStall(src netip.AddrPort) (secs uint32) {
 	return
 }
 
+// UseDefaultEchoReply leaves locally assigned ZeroTier addresses to gVisor's
+// built-in responder. Remote ZeroTier destinations still use Ping and the
+// direct ZeroTier packet path below.
+func (h *icmpHandler) UseDefaultEchoReply(_src, dst netip.AddrPort) bool {
+	return h.ztFlow != nil && dst.IsValid() && h.ztFlow.owns(dst.Addr())
+}
+
 // Ping implements netstack.GICMPHandler. Takes ownership of msg.
 // Nb: to send icmp pings, root access is required; and so,
 // send "unprivileged" icmp pings via udp reqs; which do

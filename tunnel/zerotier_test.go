@@ -10,11 +10,13 @@ import (
 	"bytes"
 	"net"
 	"net/netip"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/celzero/firestack/intra/netstack"
 	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/checksum"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -31,6 +33,18 @@ type packetRecorder struct {
 	protocol tcpip.NetworkProtocolNumber
 	called   bool
 }
+
+type echoResponder struct{ pingCalls atomic.Int32 }
+
+func (*echoResponder) OpenConns() string            { return "0" }
+func (*echoResponder) CloseConns([]string) []string { return nil }
+func (*echoResponder) End()                         {}
+func (*echoResponder) Reset()                       {}
+func (e *echoResponder) Ping([]byte, netip.AddrPort, netip.AddrPort) bool {
+	e.pingCalls.Add(1)
+	return true
+}
+func (*echoResponder) UseDefaultEchoReply(netip.AddrPort, netip.AddrPort) bool { return true }
 
 func (r *packetRecorder) DeliverNetworkPacket(protocol tcpip.NetworkProtocolNumber, _ *stack.PacketBuffer) {
 	r.protocol, r.called = protocol, true
@@ -58,6 +72,98 @@ func TestInjectZeroTierFrameParsesEthernetProtocol(t *testing.T) {
 	}
 	if err := ep.injectFrame(frame[:header.EthernetMinimumSize-1]); err == nil {
 		t.Fatal("short Ethernet frame accepted")
+	}
+}
+
+func TestInjectedZeroTierEchoGetsOneTTL64Reply(t *testing.T) {
+	const (
+		nic       tcpip.NICID = 2
+		localMAC              = "02:00:00:00:00:02"
+		remoteMAC             = "02:00:00:00:00:09"
+	)
+	localIP := tcpip.AddrFrom4([4]byte{192, 168, 192, 7})
+	remoteIP := tcpip.AddrFrom4([4]byte{192, 168, 192, 9})
+	frames := &frameRecorder{frames: make(chan []byte, 4)}
+	s := netstack.NewNetstack()
+	defer s.Close()
+	netstack.SetNetstackOpts(s)
+	responder := &echoResponder{}
+	netstack.OutboundICMP("zerotier-test", s, responder)
+	ep, err := newZeroTierEndpoint("test", localMAC, 1400, frames)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateNIC(nic, ep); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetSpoofing(nic, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetPromiscuousMode(nic, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddProtocolAddress(nic, tcpip.ProtocolAddress{
+		Protocol:          ipv4.ProtocolNumber,
+		AddressWithPrefix: tcpip.AddressWithPrefix{Address: localIP, PrefixLen: 24},
+	}, stack.AddressProperties{PEB: stack.CanBePrimaryEndpoint}); err != nil {
+		t.Fatal(err)
+	}
+	remoteMACBytes, err := net.ParseMAC(remoteMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddStaticNeighbor(nic, ipv4.ProtocolNumber, remoteIP, tcpip.LinkAddress(remoteMACBytes)); err != nil {
+		t.Fatal(err)
+	}
+	prefix := netip.MustParsePrefix("192.168.192.0/24")
+	s.SetRouteTable([]tcpip.Route{{Destination: tcpipSubnet(prefix), NIC: nic}})
+	localMACBytes, _ := net.ParseMAC(localMAC)
+	frame := make([]byte, header.EthernetMinimumSize+header.IPv4MinimumSize+header.ICMPv4MinimumSize+8)
+	header.Ethernet(frame).Encode(&header.EthernetFields{
+		SrcAddr: tcpip.LinkAddress(remoteMACBytes),
+		DstAddr: tcpip.LinkAddress(localMACBytes),
+		Type:    header.IPv4ProtocolNumber,
+	})
+	ip := header.IPv4(frame[header.EthernetMinimumSize:])
+	ip.Encode(&header.IPv4Fields{
+		TotalLength: uint16(header.IPv4MinimumSize + header.ICMPv4MinimumSize + 8),
+		TTL:         64,
+		Protocol:    uint8(header.ICMPv4ProtocolNumber),
+		SrcAddr:     remoteIP,
+		DstAddr:     localIP,
+	})
+	ip.SetChecksum(^ip.CalculateChecksum())
+	icmp := header.ICMPv4(frame[header.EthernetMinimumSize+header.IPv4MinimumSize:])
+	icmp.SetType(header.ICMPv4Echo)
+	icmp.SetCode(header.ICMPv4UnusedCode)
+	icmp.SetChecksum(^checksum.Checksum(icmp, 0))
+	if err := ep.injectFrame(frame); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case reply := <-frames.frames:
+		if got := header.Ethernet(reply).Type(); got != header.IPv4ProtocolNumber {
+			t.Fatalf("reply Ethernet type = %#x; want IPv4", got)
+		}
+		ipReply := header.IPv4(reply[header.EthernetMinimumSize:])
+		if got := ipReply.TTL(); got != 64 {
+			t.Fatalf("reply TTL = %d; want 64", got)
+		}
+		icmpReply := header.ICMPv4(reply[header.EthernetMinimumSize+int(ipReply.HeaderLength()):])
+		if got := icmpReply.Type(); got != header.ICMPv4EchoReply {
+			t.Fatalf("reply ICMP type = %d; want echo reply", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ZeroTier echo request produced no reply")
+	}
+	select {
+	case extra := <-frames.frames:
+		t.Fatalf("one ZeroTier echo request produced an extra frame (%d bytes)", len(extra))
+	case <-time.After(50 * time.Millisecond):
+	}
+	if got := responder.pingCalls.Load(); got != 0 {
+		t.Fatalf("local ZeroTier echo was forwarded to custom Ping %d times; want 0", got)
 	}
 }
 
